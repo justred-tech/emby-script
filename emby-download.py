@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Emby Download Manager
-Script mejorado para descargar películas y series de Jellyfin/Emby
+Emby Download Manager (Fixed)
+Arreglado para evitar OOM (Out Of Memory) al guardar progreso demasiado seguido.
 """
 
 import argparse
@@ -18,8 +18,9 @@ from typing import Dict, List, Optional, Any
 CONFIG_FILE = Path(__file__).parent / "emby.conf"
 PROGRESS_FILE = Path(__file__).parent / "download_progress.json"
 DEFAULT_TIMEOUT = 300  # 5 minutos
-CHUNK_SIZE = 8192  # 8 KB chunks para progreso
-
+CHUNK_SIZE = 8192  # 8 KB chunks para streaming
+# NUEVO: Guardar progreso cada 10 MB descargados (en lugar de cada 8 KB)
+SAVE_INTERVAL_BYTES = 10 * 1024 * 1024  # 10 MB
 
 class EmbyClient:
     """Cliente para conectar con servidor Emby/Jellyfin"""
@@ -108,8 +109,13 @@ class DownloadManager:
 
     def save_progress(self):
         """Guardar estado de descargas"""
-        with open(PROGRESS_FILE, "w") as f:
-            json.dump(self.progress, f, indent=2)
+        # NOTA: Ahora solo se llama periódicamente, no en cada chunk
+        try:
+            with open(PROGRESS_FILE, "w") as f:
+                # Usamos indent para legibilidad, pero es menos frecuente ahora
+                json.dump(self.progress, f, indent=2)
+        except Exception as e:
+            print(f"\n⚠️  Error guardando progreso: {e}", file=sys.stderr)
 
     def add_download(self, item_id: str, dest: str) -> str:
         """Agregar nueva descarga a la cola"""
@@ -139,7 +145,7 @@ class DownloadManager:
 
     def clean_filename(self, name: str) -> str:
         """Limpiar nombre de archivo"""
-        invalid_chars = '<>:"/\\|?*'
+        invalid_chars = '<>:"/\|?*'
         for char in invalid_chars:
             name = name.replace(char, "_")
         return name
@@ -170,8 +176,11 @@ class DownloadManager:
 
         # Obtener tamaño total si no lo tenemos
         if dl["total_bytes"] == 0:
-            response = requests.head(url, headers=headers, timeout=30)
-            dl["total_bytes"] = int(response.headers.get("Content-Length", 0))
+            try:
+                response = requests.head(url, headers=headers, timeout=30)
+                dl["total_bytes"] = int(response.headers.get("Content-Length", 0))
+            except Exception as e:
+                print(f"\n⚠️  No se pudo obtener tamaño total: {e}")
 
         dl["downloaded_bytes"] = downloaded
         self.save_progress()
@@ -180,36 +189,55 @@ class DownloadManager:
         mode = "ab" if downloaded > 0 else "wb"
 
         try:
+            # Aumentar timeout para archivos grandes
+            # requests.get mantiene la conexión abierta con timeout. Si el servidor tarda mucho en enviar un byte, corta.
+            # 300 segundos es bastante, pero para 56GB es razonable.
             with requests.get(url, headers=headers, stream=True, timeout=DEFAULT_TIMEOUT) as r:
                 r.raise_for_status()
 
                 total = dl["total_bytes"]
+                next_save = downloaded + SAVE_INTERVAL_BYTES  # Próximo momento para guardar
+
                 with open(temp_path, mode) as f:
                     for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
+                            
+                            # Actualizar progreso en memoria (rápido)
                             dl["downloaded_bytes"] = downloaded
                             dl["progress"] = (downloaded / total * 100) if total > 0 else 0
-                            self.save_progress()
 
-                            # Mostrar progreso
-                            print(f"\r  {dl['name']}: {dl['progress']:.1f}% ({downloaded}/{total} bytes)", end="", flush=True)
+                            # Guardar progreso en disco SOLO si pasa el intervalo (ahorrando RAM y Disco)
+                            if downloaded >= next_save or downloaded >= total:
+                                self.save_progress()
+                                next_save = downloaded + SAVE_INTERVAL_BYTES
+
+                            # Mostrar progreso (limitar frecuencia de print no afecta tanto, pero visualmente es mejor)
+                            # Opcional: Solo imprimir cada 1% o cada MB para no saturar stdout
+                            if (downloaded % (1024 * 1024)) == 0: # Cada 1 MB
+                                print(f"\r  {dl['name']}: {dl['progress']:.1f}% ({downloaded}/{total} bytes)", end="", flush=True)
 
             # Completar descarga
             temp_path.rename(final_path)
             dl["status"] = "completed"
             dl["completed_at"] = datetime.now().isoformat()
-            self.save_progress()
+            self.save_progress()  # Guardado final obligatorio
 
             size_gb = final_path.stat().st_size / (1024**3)
-            print(f"\n✓ Descargado: {final_path} ({size_gb:.2f} GB)")
+            print(f"\n✓  Descargado: {final_path} ({size_gb:.2f} GB)")
 
+        except requests.exceptions.Timeout:
+            dl["status"] = "error"
+            dl["error"] = "Timeout de conexión"
+            self.save_progress()
+            print(f"\n✗  Error: Timeout de conexión (el servidor tardó demasiado en enviar datos)")
+            raise
         except Exception as e:
             dl["status"] = "error"
             dl["error"] = str(e)
             self.save_progress()
-            print(f"\n✗ Error: {e}")
+            print(f"\n✗  Error: {e}")
             raise
 
     def status(self, download_id: Optional[str] = None):
@@ -226,7 +254,7 @@ class DownloadManager:
             print("No hay descargas en progreso o completadas.")
             return
 
-        print("\n📥 Descargas:")
+        print("\n📥  Descargas:")
         print("-" * 80)
 
         for dl in downloads:
@@ -240,7 +268,7 @@ class DownloadManager:
             progress = dl.get("progress", 0)
             total_gb = dl["total_bytes"] / (1024**3) if dl["total_bytes"] else 0
 
-            print(f"{status_icon} {dl['name']}")
+            print(f"{status_icon}  {dl['name']}")
             print(f"   Estado: {dl['status']}")
             print(f"   Progreso: {progress:.1f}% ({total_gb:.2f} GB)")
             print(f"   Destino: {dl['final_path']}")
@@ -280,7 +308,7 @@ class DownloadManager:
             print("No hay descargas registradas.")
             return
 
-        print("\n📥 Descargas registradas:")
+        print("\n📥  Descargas registradas:")
         print("-" * 80)
 
         for dl_id, dl in downloads.items():
@@ -291,13 +319,13 @@ class DownloadManager:
                 "error": "✗"
             }.get(dl["status"], "?")
 
-            print(f"{status_icon} [{dl_id[:12]}...] {dl['name']} ({dl['status']})")
+            print(f"{status_icon}  [{dl_id[:12]}...] {dl['name']} ({dl['status']})")
 
         print()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Emby Download Manager")
+    parser = argparse.ArgumentParser(description="Emby Download Manager (Fixed)")
     subparsers = parser.add_subparsers(dest="command", help="Comando a ejecutar")
 
     # Search
@@ -341,7 +369,7 @@ def main():
                     print(f"No se encontraron resultados para: {args.query}")
                     return
 
-                print(f"\n📺 Resultados para '{args.query}':")
+                print(f"\n📺  Resultados para '{args.query}':")
                 print("-" * 80)
 
                 for item in results:
